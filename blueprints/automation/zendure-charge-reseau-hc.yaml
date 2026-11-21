@@ -1,0 +1,640 @@
+blueprint:
+  name: Zendure SolarFlow - Charge réseau en heures creuses
+  description: >-
+    Recharge une batterie (Zendure SolarFlow 800 Plus par défaut, adaptable à
+    toute batterie pilotée par des entités number/select) depuis le réseau
+    uniquement pendant les heures creuses, au plus tard possible, jusqu'à un
+    niveau cible calculé, puis coupe.
+
+
+    Cible dynamique : le bilan net n'utilise pas la production brute mais
+    production prévue - consommation MATINALE apprise (fenêtre : heures
+    pleines + solaire sous le seuil, avant l'heure limite réglable). Référence
+    = max(moyenne apprise, dernière matinée mesurée) : en régime stable la
+    moyenne domine, mais le lendemain d'une matinée froide atypique (ex.
+    premier jour de chauffage), la valeur de la veille gonfle la cible.
+
+
+    Charge au plus tard : la fin des heures creuses est lue dans le planning
+    (schedule.get_schedule), plages contiguës recollées (tolérance 1 s car
+    minuit peut valoir 23:59:59.999999), sans heure écrite en dur ; le lever
+    du soleil utilisé est celui du jour où se termine la période d'heures
+    creuses (pas de charge inutile le week-end quand les heures creuses
+    durent toute la journée). Départ = fin visée - durée nécessaire,
+    recalculé en continu.
+
+
+    Pilotage matériel : ordre d'une charge = limite de sortie à 0, puis mode
+    AC sur input, puis 3 s d'attente, puis limite d'entrée. Retour sur
+    output dès qu'on ne charge plus (sinon la production solaire s'arrête).
+
+
+    Rentabilité économique : la charge n'est visée que si le coût réel du
+    kWh stocké (tarif heures creuses / rendement) reste inférieur au tarif
+    heures pleines. Sinon, cible réduite au SOC minimal de confort.
+
+
+    Prérequis : 8 helpers d'état à créer côté Home Assistant (5 input_number
+    d'apprentissage/accumulation, 2 input_number de diagnostic, 1
+    input_datetime) — voir docs/blueprint-charge-hc.md dans le dépôt. Les
+    paramètres numériques (capacité, tarifs, seuils...) sont configurés ici
+    comme champs du blueprint, avec valeurs par défaut.
+  domain: automation
+  input:
+    planning_hc:
+      name: Planning heures creuses
+      description: >-
+        Helper schedule définissant les heures creuses. Minuit peut être
+        représenté par 23:59:59.999999 : la tolérance de fusion est de 1 s.
+      selector:
+        entity:
+          domain: schedule
+    capteur_soc:
+      name: Niveau de batterie (%)
+      selector:
+        entity:
+          domain: sensor
+    capteur_solaire:
+      name: Puissance solaire entrante (W)
+      selector:
+        entity:
+          domain: sensor
+    capteur_prevision_restante:
+      name: Prévision solaire restante aujourd'hui (kWh)
+      description: Capteur en kWh (multiplication par 1000 appliquée en interne).
+      selector:
+        entity:
+          domain: sensor
+    capteur_prevision_demain:
+      name: Prévision solaire demain (kWh)
+      selector:
+        entity:
+          domain: sensor
+    capteur_conso_reseau:
+      name: Consommation résiduelle au compteur réseau (W)
+      description: >-
+        Déjà nette des productions injectées avant le compteur ; peut être
+        négative (export).
+      selector:
+        entity:
+          domain: sensor
+    capteur_beem:
+      name: Puissance autre production (W)
+      description: >-
+        Source non pilotable injectée avant le compteur (ex. Beem). Utilisée
+        uniquement pour la puissance maison instantanée, jamais soustraite
+        deux fois du résiduel réseau.
+      selector:
+        entity:
+          domain: sensor
+    capteur_sortie_maison:
+      name: Sortie batterie vers maison (W)
+      description: Solaire et batterie confondus (ex. output_home_power).
+      selector:
+        entity:
+          domain: sensor
+    capteur_rendement:
+      name: Rendement aller-retour (%)
+      description: Accepte 0-1 ou 0-100 ; repli interne à 85 % si indisponible ou nul.
+      selector:
+        entity:
+          domain: sensor
+    limite_entree:
+      name: Limite de charge réseau (number)
+      selector:
+        entity:
+          domain: number
+    limite_sortie:
+      name: Limite de décharge (number)
+      selector:
+        entity:
+          domain: number
+    select_mode_ac:
+      name: Mode AC (select input/output)
+      description: Options détectées par leur contenu en minuscules (input/output).
+      selector:
+        entity:
+          domain: select
+    helper_conso_maison_moyenne:
+      name: Helper - consommation maison moyenne apprise
+      selector:
+        entity:
+          domain: input_number
+    helper_conso_maison_accumulee:
+      name: Helper - consommation maison accumulée (jour en cours)
+      selector:
+        entity:
+          domain: input_number
+    helper_conso_matinale_moyenne:
+      name: Helper - consommation matinale moyenne apprise
+      selector:
+        entity:
+          domain: input_number
+    helper_conso_matinale_derniere:
+      name: Helper - consommation matinale dernière mesurée
+      selector:
+        entity:
+          domain: input_number
+    helper_conso_matinale_accumulee:
+      name: Helper - consommation matinale accumulée (jour en cours)
+      selector:
+        entity:
+          domain: input_number
+    helper_dernier_rendement:
+      name: Helper - dernier rendement mesuré (diagnostic)
+      selector:
+        entity:
+          domain: input_number
+    helper_duree_charge_calculee:
+      name: Helper - durée de charge calculée en minutes (diagnostic)
+      selector:
+        entity:
+          domain: input_number
+    helper_depart_charge_calcule:
+      name: Helper - date/heure de départ de charge calculée (diagnostic)
+      selector:
+        entity:
+          domain: input_datetime
+    capacite_wh:
+      name: Capacité totale de la batterie (Wh)
+      default: 1920
+      selector:
+        number:
+          min: 96
+          max: 115200
+          step: 10
+          unit_of_measurement: Wh
+          mode: box
+    seuil_debut_solaire_w:
+      name: Seuil de détection du démarrage solaire (W)
+      default: 30
+      selector:
+        number:
+          min: 5
+          max: 1000
+          step: 5
+          unit_of_measurement: W
+          mode: box
+    puissance_charge_transition_w:
+      name: Puissance de charge après démarrage du solaire (W)
+      description: 0 par défaut, pour une priorité totale au solaire.
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 2000
+          step: 10
+          unit_of_measurement: W
+          mode: box
+    puissance_charge_hc_w:
+      name: Puissance de charge réseau en heures creuses (W)
+      default: 600
+      selector:
+        number:
+          min: 0
+          max: 2000
+          step: 25
+          unit_of_measurement: W
+          mode: box
+    soc_max_charge_pct:
+      name: SOC maximal autorisé via charge réseau (%)
+      default: 90
+      selector:
+        number:
+          min: 50
+          max: 100
+          step: 1
+          unit_of_measurement: "%"
+          mode: box
+    soc_min_confort_pct:
+      name: SOC minimal visé en fin d'heures creuses (%)
+      default: 30
+      selector:
+        number:
+          min: 0
+          max: 80
+          step: 5
+          unit_of_measurement: "%"
+          mode: box
+    marge_reserve_pct:
+      name: Marge de réserve pour incertitude de prévision solaire (%)
+      default: 10
+      selector:
+        number:
+          min: 0
+          max: 50
+          step: 1
+          unit_of_measurement: "%"
+          mode: box
+    fin_fenetre_matinale_h:
+      name: Heure limite de fin de fenêtre matinale (heure pleine, 8-20)
+      default: 14
+      selector:
+        number:
+          min: 8
+          max: 20
+          step: 1
+          mode: box
+    alpha_apprentissage_conso:
+      name: Poids d'apprentissage consommation journalière (0.05-1)
+      default: 0.3
+      selector:
+        number:
+          min: 0.05
+          max: 1
+          step: 0.05
+          mode: box
+    alpha_apprentissage_matinale:
+      name: Poids d'apprentissage consommation matinale (0.05-1)
+      default: 0.3
+      selector:
+        number:
+          min: 0.05
+          max: 1
+          step: 0.05
+          mode: box
+    tarif_hc:
+      name: Tarif heures creuses (€/kWh)
+      default: 0.18252
+      selector:
+        number:
+          min: 0
+          max: 1
+          step: 0.00001
+          unit_of_measurement: "€/kWh"
+          mode: box
+    tarif_hp:
+      name: Tarif heures pleines (€/kWh)
+      default: 0.24502
+      selector:
+        number:
+          min: 0
+          max: 1
+          step: 0.00001
+          unit_of_measurement: "€/kWh"
+          mode: box
+    marge_temps_charge_min:
+      name: Marge de sécurité sur la durée de charge (minutes)
+      default: 20
+      selector:
+        number:
+          min: 0
+          max: 120
+          step: 5
+          unit_of_measurement: min
+          mode: box
+    delai_apres_lever_min:
+      name: Délai après lever de soleil avant solaire utile (minutes)
+      default: 30
+      selector:
+        number:
+          min: 0
+          max: 120
+          step: 5
+          unit_of_measurement: min
+          mode: box
+    heure_bilan:
+      name: Heure du bilan quotidien (apprentissage)
+      default: "23:58:00"
+      selector:
+        time: {}
+triggers:
+  - trigger: state
+    entity_id: !input planning_hc
+    id: hc_change
+  - trigger: time_pattern
+    minutes: /2
+    id: reeval
+  - trigger: numeric_state
+    entity_id: !input capteur_solaire
+    above: !input seuil_debut_solaire_w
+    id: solaire_demarre
+  - trigger: time
+    at: !input heure_bilan
+    id: bilan_conso_maison
+conditions: []
+variables:
+  planning_hc_entite: !input planning_hc
+  capteur_soc_entite: !input capteur_soc
+  capteur_solaire_entite: !input capteur_solaire
+  capteur_prevision_restante_entite: !input capteur_prevision_restante
+  capteur_prevision_demain_entite: !input capteur_prevision_demain
+  capteur_conso_reseau_entite: !input capteur_conso_reseau
+  capteur_beem_entite: !input capteur_beem
+  capteur_sortie_maison_entite: !input capteur_sortie_maison
+  capteur_rendement_entite: !input capteur_rendement
+  limite_entree_entite: !input limite_entree
+  limite_sortie_entite: !input limite_sortie
+  select_mode_ac_entite: !input select_mode_ac
+  conso_maison_moyenne_entite: !input helper_conso_maison_moyenne
+  conso_maison_accumulee_entite: !input helper_conso_maison_accumulee
+  conso_matinale_moyenne_entite: !input helper_conso_matinale_moyenne
+  conso_matinale_derniere_entite: !input helper_conso_matinale_derniere
+  conso_matinale_accumulee_entite: !input helper_conso_matinale_accumulee
+  dernier_rendement_entite: !input helper_dernier_rendement
+  duree_charge_calculee_entite: !input helper_duree_charge_calculee
+  depart_charge_calcule_entite: !input helper_depart_charge_calcule
+  capacite_wh: !input capacite_wh
+  seuil_debut_solaire: !input seuil_debut_solaire_w
+  puissance_charge_transition: !input puissance_charge_transition_w
+  puissance_charge_hc_w: !input puissance_charge_hc_w
+  soc_max_charge: !input soc_max_charge_pct
+  soc_min_confort: !input soc_min_confort_pct
+  marge_reserve_pct: !input marge_reserve_pct
+  fin_fenetre_matinale_h: !input fin_fenetre_matinale_h
+  alpha_apprentissage_conso: !input alpha_apprentissage_conso
+  alpha_apprentissage_matinale: !input alpha_apprentissage_matinale
+  tarif_hc: !input tarif_hc
+  tarif_hp: !input tarif_hp
+  marge_temps_min: !input marge_temps_charge_min
+  delai_apres_lever_min: !input delai_apres_lever_min
+  soc_actuel: "{{ states(capteur_soc_entite) | float(0) }}"
+  solaire_instant: "{{ states(capteur_solaire_entite) | float(0) }}"
+  prochaine_prod_solarflow_wh: |-
+    {{ (states(capteur_prevision_restante_entite) | float(0)
+        if now().hour < 12
+        else states(capteur_prevision_demain_entite) | float(0)) * 1000 }}
+  fenetre_matinale: >-
+    {{ (not is_state(planning_hc_entite, 'on')) and solaire_instant <=
+    seuil_debut_solaire and now().hour < fin_fenetre_matinale_h }}
+  conso_matinale_moyenne_wh: "{{ states(conso_matinale_moyenne_entite) | float(2000) }}"
+  conso_matinale_derniere_wh: "{{ states(conso_matinale_derniere_entite) | float(0) }}"
+  conso_matinale_reference_wh: "{{ [conso_matinale_moyenne_wh, conso_matinale_derniere_wh] | max }}"
+  conso_maison_prevue_wh: "{{ conso_matinale_reference_wh }}"
+  bilan_net_attendu_wh: "{{ prochaine_prod_solarflow_wh - conso_maison_prevue_wh }}"
+  place_necessaire_pct: |-
+    {{ 0 if (capacite_wh <= 0 or bilan_net_attendu_wh <= 0) else
+       ([100, (bilan_net_attendu_wh / capacite_wh) * 100] | min) }}
+  cible_soc_pleine: |-
+    {{ soc_max_charge if bilan_net_attendu_wh <= 0 else
+       ([soc_min_confort,
+         [soc_max_charge, 100 - place_necessaire_pct - marge_reserve_pct] | min] | max
+         | round(0)) }}
+  puissance_maison_instant_w: |-
+    {{ (states(capteur_conso_reseau_entite) | float(0))
+       + (states(capteur_beem_entite) | float(0))
+       + (states(capteur_sortie_maison_entite) | float(0)) }}
+  secondes_depuis_derniere_accumulation: >-
+    {% set s = expand(conso_maison_accumulee_entite) | list %}
+    {{ (now() - s[0].last_changed).total_seconds() if s else 600 }}
+  energie_ajoutee_wh: >-
+    {{ puissance_maison_instant_w * ([secondes_depuis_derniere_accumulation, 600] | min) / 3600 }}
+  secondes_depuis_derniere_accumulation_matinale: >-
+    {% set s = expand(conso_matinale_accumulee_entite) | list %}
+    {{ (now() - s[0].last_changed).total_seconds() if s else 600 }}
+  energie_ajoutee_matinale_wh: >-
+    {{ puissance_maison_instant_w *
+    ([secondes_depuis_derniere_accumulation_matinale, 600] | min) / 3600
+       if fenetre_matinale else 0 }}
+  rendement_brut: "{{ states(capteur_rendement_entite) | float(85) }}"
+  rendement_pct_lu: "{{ rendement_brut if rendement_brut > 1 else rendement_brut * 100 }}"
+  rendement_pct: "{{ rendement_pct_lu if rendement_pct_lu > 0 else 85 }}"
+  cout_reel_par_kwh_stocke: "{{ (tarif_hc / (rendement_pct / 100)) | round(5) }}"
+  charge_rentable: "{{ cout_reel_par_kwh_stocke < tarif_hp }}"
+  economie_par_kwh: "{{ (tarif_hp - cout_reel_par_kwh_stocke) | round(5) }}"
+  cible_soc_hc: "{{ cible_soc_pleine if charge_rentable else soc_min_confort }}"
+  delta_soc_a_charger_pct: "{{ [0, cible_soc_hc - soc_actuel] | max }}"
+  energie_manquante_batterie_wh: "{{ (delta_soc_a_charger_pct / 100) * capacite_wh }}"
+  rendement_charge_estime: "{{ (rendement_pct / 100) ** 0.5 }}"
+  energie_a_puiser_reseau_wh: |-
+    {{ (energie_manquante_batterie_wh / rendement_charge_estime)
+       if rendement_charge_estime > 0 else energie_manquante_batterie_wh }}
+  puissance_charge_hc: "{{ [puissance_charge_hc_w, 600] | min }}"
+  duree_necessaire_s: >-
+    {{ (((energie_a_puiser_reseau_wh / puissance_charge_hc) if
+    puissance_charge_hc > 0 else 0) * 3600) + (marge_temps_min * 60) }}
+  maintenant_ts: "{{ now().timestamp() }}"
+actions:
+  - action: schedule.get_schedule
+    continue_on_error: true
+    target:
+      entity_id: !input planning_hc
+    response_variable: planning
+  - variables:
+      hc_fin_ts: |-
+        {% set jours = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'] %}
+        {% set minuit = now().replace(hour=0, minute=0, second=0, microsecond=0) %}
+        {% set ns = namespace(fin=none, resultat=none) %}
+        {% if planning is defined and planning[planning_hc_entite] is defined %}
+          {% set plan = planning[planning_hc_entite] %}
+          {% for d in range(-1, 9) %}
+            {% set jour = minuit + timedelta(days=d) %}
+            {% for p in plan[jours[jour.weekday()]] %}
+              {% set f = (p['from'] | string).split(':') %}
+              {% set t = (p['to'] | string).split(':') %}
+              {% set deb = jour.replace(hour=f[0]|int, minute=f[1]|int, second=(f[2]|int if f|length > 2 else 0)).timestamp() %}
+              {% if t[0]|int >= 24 %}
+                {% set fin = (jour + timedelta(days=1)).timestamp() %}
+              {% else %}
+                {% set fin = jour.replace(hour=t[0]|int, minute=t[1]|int, second=(t[2]|int if t|length > 2 else 0)).timestamp() %}
+              {% endif %}
+              {% if fin <= deb %}
+                {% set fin = (jour + timedelta(days=1)).timestamp() %}
+              {% endif %}
+              {% if ns.fin is not none and deb <= ns.fin + 1 %}
+                {% if fin > ns.fin %}{% set ns.fin = fin %}{% endif %}
+              {% else %}
+                {% if ns.fin is not none and ns.fin > maintenant_ts and ns.resultat is none %}
+                  {% set ns.resultat = ns.fin %}
+                {% endif %}
+                {% set ns.fin = fin %}
+              {% endif %}
+            {% endfor %}
+          {% endfor %}
+          {% if ns.fin is not none and ns.fin > maintenant_ts and ns.resultat is none %}
+            {% set ns.resultat = ns.fin %}
+          {% endif %}
+        {% endif %}
+        {{ ns.resultat if ns.resultat is not none else maintenant_ts + 28800 }}
+      solaire_fin_ts: |-
+        {% set nr = as_timestamp(state_attr('sun.sun', 'next_rising'), maintenant_ts + 28800) %}
+        {% set n = ((hc_fin_ts - nr) / 86400 + 0.5) | round(0, 'floor') | int %}
+        {{ nr + (n if n > 0 else 0) * 86400 + delai_apres_lever_min * 60 }}
+      ac_mode_entree: |-
+        {% set ns = namespace(r='input') %}
+        {% for o in (state_attr(select_mode_ac_entite, 'options') or []) %}
+          {% if 'input' in (o | string | lower) %}{% set ns.r = o %}{% endif %}
+        {% endfor %}
+        {{ ns.r }}
+      ac_mode_sortie: |-
+        {% set ns = namespace(r='output') %}
+        {% for o in (state_attr(select_mode_ac_entite, 'options') or []) %}
+          {% if 'output' in (o | string | lower) %}{% set ns.r = o %}{% endif %}
+        {% endfor %}
+        {{ ns.r }}
+      fin_visee_ts: "{{ [hc_fin_ts, solaire_fin_ts] | min }}"
+      depart_recommande_ts: "{{ fin_visee_ts - duree_necessaire_s }}"
+      temps_restant_s: "{{ fin_visee_ts - maintenant_ts }}"
+      moment_de_charger: >-
+        {{ (maintenant_ts >= depart_recommande_ts) or (duree_necessaire_s >= temps_restant_s) }}
+      veut_charger: |-
+        {{ is_state(planning_hc_entite, 'on')
+           and solaire_instant <= seuil_debut_solaire
+           and soc_actuel < cible_soc_hc and moment_de_charger }}
+  - action: input_number.set_value
+    target:
+      entity_id: !input helper_conso_maison_accumulee
+    data:
+      value: |-
+        {{ (states(conso_maison_accumulee_entite) | float(0)) + energie_ajoutee_wh }}
+  - action: input_number.set_value
+    target:
+      entity_id: !input helper_conso_matinale_accumulee
+    data:
+      value: >-
+        {{ (states(conso_matinale_accumulee_entite) | float(0)) +
+        energie_ajoutee_matinale_wh }}
+  - if:
+      - condition: trigger
+        id: bilan_conso_maison
+    then:
+      - variables:
+          conso_jour_ecoule_wh: >-
+            {{ (states(conso_maison_accumulee_entite) | float(0)) + energie_ajoutee_wh }}
+          moyenne_precedente_wh: "{{ states(conso_maison_moyenne_entite) | float(3000) }}"
+          conso_matinale_ecoulee_wh: "{{ states(conso_matinale_accumulee_entite) | float(0) }}"
+          moyenne_matinale_precedente_wh: "{{ states(conso_matinale_moyenne_entite) | float(2000) }}"
+      - if:
+          - condition: template
+            value_template: "{{ conso_jour_ecoule_wh > 200 }}"
+        then:
+          - action: input_number.set_value
+            target:
+              entity_id: !input helper_conso_maison_moyenne
+            data:
+              value: |-
+                {{ (moyenne_precedente_wh * (1 - alpha_apprentissage_conso)
+                    + conso_jour_ecoule_wh * alpha_apprentissage_conso) | round(0) }}
+      - action: input_number.set_value
+        target:
+          entity_id: !input helper_conso_maison_accumulee
+        data:
+          value: 0
+      - if:
+          - condition: template
+            value_template: "{{ conso_matinale_ecoulee_wh > 100 }}"
+        then:
+          - action: input_number.set_value
+            target:
+              entity_id: !input helper_conso_matinale_derniere
+            data:
+              value: "{{ conso_matinale_ecoulee_wh | round(0) }}"
+          - action: input_number.set_value
+            target:
+              entity_id: !input helper_conso_matinale_moyenne
+            data:
+              value: >-
+                {{ (moyenne_matinale_precedente_wh * (1 - alpha_apprentissage_matinale)
+                    + conso_matinale_ecoulee_wh * alpha_apprentissage_matinale) | round(0) }}
+      - action: input_number.set_value
+        target:
+          entity_id: !input helper_conso_matinale_accumulee
+        data:
+          value: 0
+  - action: input_number.set_value
+    target:
+      entity_id: !input helper_dernier_rendement
+    data:
+      value: "{{ rendement_pct | round(1) }}"
+  - action: input_number.set_value
+    target:
+      entity_id: !input helper_duree_charge_calculee
+    data:
+      value: "{{ (duree_necessaire_s / 60) | round(0) }}"
+  - action: input_datetime.set_datetime
+    continue_on_error: true
+    target:
+      entity_id: !input helper_depart_charge_calcule
+    data:
+      timestamp: "{{ depart_recommande_ts }}"
+  - if:
+      - condition: template
+        value_template: "{{ veut_charger }}"
+    then:
+      - if:
+          - condition: numeric_state
+            entity_id: !input limite_sortie
+            above: 0
+        then:
+          - action: number.set_value
+            target:
+              entity_id: !input limite_sortie
+            data:
+              value: 0
+      - if:
+          - condition: template
+            value_template: >-
+              {{ states(select_mode_ac_entite) not in ['unavailable', 'unknown',
+              ac_mode_entree] }}
+        then:
+          - action: select.select_option
+            continue_on_error: true
+            target:
+              entity_id: !input select_mode_ac
+            data:
+              option: "{{ ac_mode_entree }}"
+          - delay:
+              seconds: 3
+  - choose:
+      - conditions:
+          - condition: state
+            entity_id: !input planning_hc
+            state: "off"
+        sequence:
+          - action: number.set_value
+            target:
+              entity_id: !input limite_entree
+            data:
+              value: 0
+      - conditions:
+          - condition: template
+            value_template: "{{ solaire_instant > seuil_debut_solaire }}"
+        sequence:
+          - action: number.set_value
+            target:
+              entity_id: !input limite_entree
+            data:
+              value: "{{ puissance_charge_transition }}"
+      - conditions:
+          - condition: state
+            entity_id: !input planning_hc
+            state: "on"
+          - condition: template
+            value_template: "{{ soc_actuel < cible_soc_hc and moment_de_charger }}"
+        sequence:
+          - action: number.set_value
+            target:
+              entity_id: !input limite_entree
+            data:
+              value: "{{ puissance_charge_hc }}"
+      - conditions:
+          - condition: state
+            entity_id: !input planning_hc
+            state: "on"
+          - condition: template
+            value_template: "{{ soc_actuel < cible_soc_hc and not moment_de_charger }}"
+        sequence:
+          - action: number.set_value
+            target:
+              entity_id: !input limite_entree
+            data:
+              value: 0
+    default:
+      - action: number.set_value
+        target:
+          entity_id: !input limite_entree
+        data:
+          value: 0
+  - if:
+      - condition: template
+        value_template: >-
+          {{ not veut_charger and is_state(select_mode_ac_entite, ac_mode_entree) }}
+    then:
+      - action: select.select_option
+        continue_on_error: true
+        target:
+          entity_id: !input select_mode_ac
+        data:
+          option: "{{ ac_mode_sortie }}"
+mode: restart
+max_exceeded: silent
